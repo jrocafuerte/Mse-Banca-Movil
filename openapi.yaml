@@ -1,0 +1,170 @@
+openapi: 3.1.0
+info:
+  title: mse-banca-movil (BFF de la app móvil)
+  version: 1.0.0
+  description: |
+    Backend for Frontend de la app nativa. Todas las rutas requieren
+    `Authorization: Bearer <access token ES256>` y `X-Device-Id`, salvo las marcadas como públicas.
+    Las operaciones monetarias exigen `Idempotency-Key` (UUID).
+servers:
+  - url: http://localhost:3000
+security:
+  - bearer: []
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer, bearerFormat: JWT }
+  parameters:
+    DeviceId: { name: X-Device-Id, in: header, required: true, schema: { type: string, pattern: '^[A-Za-z0-9-]{16,64}$' } }
+    IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, format: uuid } }
+  schemas:
+    Problem:
+      type: object
+      properties: { type: { type: string }, title: { type: string }, status: { type: integer }, detail: { type: string }, requestId: { type: string } }
+    Money: { type: number, exclusiveMinimum: 0, maximum: 50000 }
+    Currency: { type: string, enum: [USD, PEN, COP, MXN] }
+  responses:
+    Problem:
+      description: Error (RFC 9457)
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+paths:
+  /health:
+    get: { security: [], summary: Liveness, responses: { '200': { description: OK } } }
+  /.well-known/jwks.json:
+    get: { security: [], summary: Claves públicas para validar tokens emitidos, responses: { '200': { description: JWKS } } }
+  /v1/auth/login:
+    post:
+      security: []
+      summary: Paso 1 - credenciales (inicia desafío MFA)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [documentId, password, deviceId]
+              properties:
+                documentId: { type: string, pattern: '^\d{8,12}$' }
+                password: { type: string, minLength: 8, maxLength: 64, format: password }
+                deviceId: { type: string }
+      responses: { '200': { description: Desafío OTP emitido }, '401': { $ref: '#/components/responses/Problem' }, '429': { $ref: '#/components/responses/Problem' } }
+  /v1/auth/mfa/verify:
+    post:
+      security: []
+      summary: Paso 2 - OTP → access token (5 min) + refresh token rotativo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [challengeId, otp, deviceId]
+              properties: { challengeId: { type: string, format: uuid }, otp: { type: string, pattern: '^\d{6}$' }, deviceId: { type: string } }
+      responses: { '200': { description: Tokens }, '401': { $ref: '#/components/responses/Problem' } }
+  /v1/auth/refresh:
+    post:
+      security: []
+      summary: Rotación de refresh token (detección de reutilización)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [refreshToken, deviceId], properties: { refreshToken: { type: string }, deviceId: { type: string } } }
+      responses: { '200': { description: Tokens }, '401': { $ref: '#/components/responses/Problem' } }
+  /v1/auth/logout:
+    post:
+      parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+      responses: { '204': { description: Sesión revocada } }
+  /v1/position:
+    get:
+      summary: Posición consolidada (cuentas, tarjetas, préstamos)
+      parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+      responses: { '200': { description: OK }, '401': { $ref: '#/components/responses/Problem' } }
+  /v1/accounts/{id}/movements:
+    get:
+      parameters:
+        - { $ref: '#/components/parameters/DeviceId' }
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50 } }
+      responses: { '200': { description: OK }, '404': { $ref: '#/components/responses/Problem' } }
+  /v1/transfers/prepare:
+    post:
+      summary: Valida y congela la transferencia; indica si requiere OTP
+      parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [type, fromAccountId, toAccountNumber, amount, currency]
+              properties:
+                type: { type: string, enum: [OWN, THIRD_PARTY, INTERBANK] }
+                fromAccountId: { type: string }
+                toAccountNumber: { type: string, pattern: '^\d{10,20}$' }
+                bankCode: { type: string }
+                amount: { $ref: '#/components/schemas/Money' }
+                currency: { $ref: '#/components/schemas/Currency' }
+                description: { type: string, maxLength: 60 }
+      responses: { '200': { description: Transferencia preparada }, '422': { $ref: '#/components/responses/Problem' } }
+  /v1/transfers/{id}/confirm:
+    post:
+      parameters:
+        - { $ref: '#/components/parameters/DeviceId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { otp: { type: string, pattern: '^\d{6}$' } } } } }
+      responses: { '200': { description: Ejecutada }, '401': { $ref: '#/components/responses/Problem' } }
+  /v1/card-payments:
+    post:
+      parameters: [{ $ref: '#/components/parameters/DeviceId' }, { $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [cardId, fromAccountId, amountType]
+              properties:
+                cardId: { type: string }
+                fromAccountId: { type: string }
+                amountType: { type: string, enum: [MINIMUM, TOTAL, OTHER] }
+                amount: { $ref: '#/components/schemas/Money' }
+      responses: { '201': { description: Pago ejecutado }, '422': { $ref: '#/components/responses/Problem' } }
+  /v1/microfrontends/recaudos/handoff:
+    post:
+      summary: Token de un solo uso (60 s, aud=mse-recaudos) para abrir sesión en el micro frontend
+      parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+      responses: { '200': { description: handoffToken } }
+  /v1/microfrontends/recaudos/step-up:
+    post:
+      summary: Token ligado a una transacción (hash + monto) tras biometría nativa
+      parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [intentHash, amount, currency]
+              properties:
+                intentHash: { type: string, pattern: '^[a-f0-9]{64}$' }
+                amount: { $ref: '#/components/schemas/Money' }
+                currency: { $ref: '#/components/schemas/Currency' }
+                signature: { type: string, description: 'HMAC-SHA256 base64url de "intentHash|amount(2 dec)|currency" con la clave del dispositivo' }
+      responses: { '200': { description: stepUpToken }, '403': { $ref: '#/components/responses/Problem' } }
+  /v1/devices/signing-key:
+    post:
+      summary: Registra la clave de firma de transacciones del dispositivo (solo ≤ 5 min tras MFA)
+      parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false, required: [key], properties: { key: { type: string, pattern: '^[A-Za-z0-9_-]{43}$' } } }
+      responses: { '204': { description: Registrada }, '403': { $ref: '#/components/responses/Problem' } }
